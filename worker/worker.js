@@ -39,6 +39,32 @@ async function fundNav(id, origin, ctx){
   return new Response(body, {headers: {...cors(origin), "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"}});
 }
 
+/* 2026-11-06：國際期貨日線（台股策略分析「期貨」分頁）。Yahoo 圖表資料不開放跨網域，代抓。
+   GET /?y=GC=F → {d:[日期…], o, h, l, c, v, _at}；只放行下面四個代號，2020-09 起日線，暫存 30 分鐘。
+   Yahoo 的 =F 是連續近月合約，換月時有價差跳空（沒有還原）。 */
+const FUT_OK = new Set(["GC=F", "NQ=F", "6E=F", "CL=F"]);
+async function futDaily(sym, origin, ctx){
+  const json = (o, status = 200) => new Response(JSON.stringify(o), {status, headers: {...cors(origin), "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"}});
+  if(!FUT_OK.has(sym)) return json({error: "y 參數只接受 " + [...FUT_OK].join("、")}, 400);
+  const key = new Request("https://cache.local/y?s=" + encodeURIComponent(sym)), cache = caches.default;
+  let body = await cache.match(key).then(r => r && r.text());
+  if(!body){
+    const r = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?period1=1600000000&period2=${Math.floor(Date.now() / 1000)}&interval=1d`, {
+      headers: {"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+    });
+    if(!r.ok) return json({error: `Yahoo HTTP ${r.status}`}, 502);
+    const res = ((await r.json()).chart || {}).result;
+    if(!res || !res[0] || !res[0].timestamp) return json({error: "Yahoo 沒有回傳日線"}, 502);
+    // 時間戳大多是紐約當地午夜，但 gmtoffset 只給現在的時差（夏天的日線會退一天），感恩節隔天半日盤的時間戳也不是午夜；
+    // 一律換成紐約時區的日期
+    const t = res[0].timestamp, q = res[0].indicators.quote[0], tz = (res[0].meta && res[0].meta.exchangeTimezoneName) || "America/New_York";
+    const d = t.map(s => new Date(s * 1000).toLocaleDateString("en-CA", {timeZone: tz}));
+    body = JSON.stringify({d, o: q.open, h: q.high, l: q.low, c: q.close, v: q.volume, _at: Date.now()});
+    ctx.waitUntil(cache.put(key, new Response(body, {headers: {"Cache-Control": `max-age=${FUND_SEC}`}})));
+  }
+  return new Response(body, {headers: {...cors(origin), "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"}});
+}
+
 export default {
   async fetch(req, env, ctx){
     const origin = req.headers.get("Origin") || "";
@@ -46,6 +72,8 @@ export default {
     const url = new URL(req.url);
     const fund = url.searchParams.get("fund");
     if(fund != null) return fundNav(fund, origin, ctx);
+    const y = url.searchParams.get("y");
+    if(y != null) return futDaily(y, origin, ctx);
     const codes = (url.searchParams.get("s") || "").split(",").map(x => x.trim()).filter(Boolean);
     if(!codes.length || codes.length > 10 || !codes.every(c => /^[0-9A-Za-z]{2,6}$/.test(c)))
       return new Response(JSON.stringify({error: "s 參數要是 1～10 個股票代號，逗號分隔"}), {status: 400, headers: {...cors(origin), "Content-Type": "application/json; charset=utf-8"}});
